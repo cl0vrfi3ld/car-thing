@@ -322,13 +322,13 @@ while True:
     # Car trip stats, write aMPG and fuel levels to file.
     # Since we can't safely handle shutdowns, we just write to the file every fifth loop and hope we don't lose power mid-write.
     # This suuuuucks.
-    """
     if loop_count % 5 == 0:
         fh.write(
-            str(round(ampg, 2))
+            str(round(state['runtime'], 2))
+            + ","
+            str(round(state['ampg'], 2))
             + ","
             + str(round(state['fuel_level'], 1))
             + "\n"
         )
         fh.flush()
-        """
