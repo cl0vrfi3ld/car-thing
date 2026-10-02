@@ -6,9 +6,6 @@ She's got some plans.
  - Ideally the Pi would be rewired to handle shutdowns more safely. Right now, we expect power to be cut out at any 
 moment, and so we keep IO operations to a minimum. In the future, we should use a buck converter and an add-a-circuit fuse to
 hook into the car's fusebox, and let us detect when the car is turned off. 
- - We might want some threading. LCD displays are currently blocking, this sucks. It might be best to have some file 
- operations put in a thread, or background some of the queries, such as iMPG, so we can have a more accurate aMPG reading.
- This might need a rewrite of most of this code. One single thread to handle OBD queries is the way to go.
  - Serve some data over a simple http server. Having a web interface to show data on a phone connected to the Pi's hotspot 
  could be useful for adjusting settings for what to display on the LCD, or to show graphs of data collected over time.
  """
@@ -56,7 +53,8 @@ def calculate_gear(speed_mph, rpm):
 def dump(adapter):
     """
     This does two things. First, we read the VIN to create a folder to hold the corresponding dump. This is an attempt to make this cross-carpatible.
-    Next, it'll read and dump every code the car says it supports. Last, it'll get a sample pool of data.
+    Next, it'll read and dump every code the car says it supports. Last, it'll get a sample pool of data. This should be run before doing ANY work, as
+    it'll conflict with the worker threads otherwise.
     """
     vin = adapter.query(obd.commands.VIN)
 
@@ -94,27 +92,87 @@ def dump(adapter):
 lock = threading.Lock()
 stop_event = threading.Event()
 
-state = {}
+state = {
+    "speed": None,
+    "rpm": None,
+    "maf": None,
+    "equiv_ratio": None,
+    "fuel_level": None,
+    "coolant_temp": None,
+    "runtime": None,
+    "sample_id": 0,  # Used to determine sample freshness
+    # These values should never exceed 99.99 due to min() in mpg_worker().
+    "impg": None,
+    "ampg": None,
+}
+
 
 def obd_worker():
-    """ THREAD: Query the OBD adapter for all data we want to read (speed, rpm, maf, equiv, fuel level, runtime), and
-    update the state dict with raw values to make data available everywhere. The adapter can only receive one query at a time, so we need 
-    to lock this, as well as ensure we're not querying the adapter elsewhere.
+    """THREAD: Query the OBD adapter for all data we want to read (speed, rpm, maf, equiv, fuel level, runtime), and
+    update the global state dict with raw values. The adapter can only receive one query at a time, so we need
+    to lock this, as well as ensure we're not querying the adapter elsewhere. Increment sample_id.
     """
     while not stop_event.is_set():
         with lock:
-            state['speed'] = get_speed().value.magnitude
-            state['rpm'] = get_rpm().value.magnitude
-            state['maf'] = get_maf().value.magnitude
-            state['equiv_ratio'] = get_equiv_ratio().value.magnitude
-            state['fuel_level'] = get_fuel_level().value.magnitude
-            state['coolant_temp'] = get_coolant_temp().value.magnitude
-            state['runtime'] = get_runtime().value.magnitude
+            mpg_inputs_succeeded = True
+            for key, getter in (
+                ("speed", get_speed),
+                ("rpm", get_rpm),
+                ("maf", get_maf),
+                ("equiv_ratio", get_equiv_ratio),
+                ("fuel_level", get_fuel_level),
+                ("coolant_temp", get_coolant_temp),
+                ("runtime", get_runtime),
+            ):
+                value = getter()
+                if value is not None:
+                    state[key] = value
+                elif key in ("speed", "maf", "equiv_ratio"):
+                    mpg_inputs_succeeded = False
+            if mpg_inputs_succeeded:
+                state["sample_id"] += 1
         time.sleep(0.5)  # Adjust sleep as needed
 
+
+def mpg_worker():
+    """THREAD: Calculate instant MPG based on speed, maf, and equiv ratio values. The function also compares sample IDs
+    to ensure that data is only calculated when samples are guaranteed fresh."""
+    # formula from https://manuals.plus/m/8f08573961e7c5e83133532cdd853b80026fa4487393a7c52304287d758e9f39
+    impg_sample_count = 0
+    last_sample_id = 0
+    while not stop_event.is_set():
+        with lock:
+            if state["sample_id"] != last_sample_id:
+                last_sample_id = state["sample_id"]
+                if (
+                    state["speed"] is not None
+                    and state["speed"] > 0
+                    and state["maf"] is not None
+                    and state["maf"] > 0
+                    and state["equiv_ratio"] is not None
+                    and state["equiv_ratio"] > 0
+                ):
+                    impg = (
+                        (14.7 / state["equiv_ratio"]) * 6.1738 * 454 * state["speed"]
+                    ) / (3600 * state["maf"])
+                    impg = min(impg, 99.99)
+                    state["impg"] = impg
+                    impg_sample_count += 1
+                    if state["ampg"] is None:
+                        state["ampg"] = impg
+                    else:
+                        state["ampg"] += (impg - state["ampg"]) / impg_sample_count
+                    state["ampg"] = min(state["ampg"], 99.99)
+                else:
+                    state["impg"] = None
+        time.sleep(0.5)
+
+
+# Getters
+# These all return the raw values of each query, no units included. If a query fails, None is returned.
 def get_speed():
     try:
-        return adapter.query(obd.commands.SPEED, force=True)
+        return adapter.query(obd.commands.SPEED, force=True).value.magnitude
     except Exception as e:
         print(f"Error occurred while fetching speed: {e}")
         return None
@@ -122,7 +180,7 @@ def get_speed():
 
 def get_rpm():
     try:
-        return adapter.query(obd.commands.RPM, force=True)
+        return adapter.query(obd.commands.RPM, force=True).value.magnitude
     except Exception as e:
         print(f"Error occurred while fetching RPM: {e}")
         return None
@@ -130,7 +188,7 @@ def get_rpm():
 
 def get_maf():
     try:
-        return adapter.query(obd.commands.MAF, force=True)
+        return adapter.query(obd.commands.MAF, force=True).value.magnitude
     except Exception as e:
         print(f"Error occurred while fetching MAF: {e}")
         return None
@@ -138,7 +196,9 @@ def get_maf():
 
 def get_equiv_ratio():
     try:
-        return adapter.query(obd.commands.COMMANDED_EQUIV_RATIO, force=True)
+        return adapter.query(
+            obd.commands.COMMANDED_EQUIV_RATIO, force=True
+        ).value.magnitude
     except Exception as e:
         print(f"Error occurred while fetching equiv ratio: {e}")
         return None
@@ -146,7 +206,7 @@ def get_equiv_ratio():
 
 def get_fuel_level():
     try:
-        return adapter.query(obd.commands.FUEL_LEVEL, force=True)
+        return adapter.query(obd.commands.FUEL_LEVEL, force=True).value.magnitude
     except Exception as e:
         print(f"Error occurred while fetching fuel level: {e}")
         return None
@@ -154,7 +214,7 @@ def get_fuel_level():
 
 def get_coolant_temp():
     try:
-        return adapter.query(obd.commands.COOLANT_TEMP, force=True)
+        return adapter.query(obd.commands.COOLANT_TEMP, force=True).value.magnitude
     except Exception as e:
         print(f"Error occurred while fetching coolant temp: {e}")
         return None
@@ -162,12 +222,13 @@ def get_coolant_temp():
 
 def get_runtime():
     try:
-        return adapter.query(obd.commands.RUN_TIME, force=True)
+        return adapter.query(obd.commands.RUN_TIME, force=True).value.magnitude
     except Exception as e:
         print(f"Error occurred while fetching runtime: {e}")
         return None
 
 
+### MAIN
 # Initialize LCD and attempt to connect to OBD adapter, if not detected, keep trying
 lcd_msg("Initializing...")
 adapter = obd.OBD()
@@ -179,12 +240,11 @@ while adapter.status() is not OBDStatus.CAR_CONNECTED:
             lcd_msg("Adapter detected", "No car connected")
         case OBDStatus.OBD_CONNECTED:
             lcd_msg("Adapter detected", "No ECU response")
-    time.sleep(3)
+    time.sleep(2)
     adapter = obd.OBD()
 
-# If initial loop is exited we must be good to go, open new file for writing
+# If initial loop is exited we must be good to go, dump info for VIN, and open new file for writing
 print("We're ready, go go go...")
-
 
 dump(adapter)
 
@@ -202,57 +262,61 @@ lcd.lcd_clear()
 # If the adapter is unplugged mid-loop the script crashes and systemd handles a restart...
 # like, this works?? but definitely not the best way to do this.
 
-impg_arr = []
-ampg = None
+obd_thread = threading.Thread(target=obd_worker, daemon=True)
+obd_thread.start()
+mpg_thread = threading.Thread(target=mpg_worker, daemon=True)
+mpg_thread.start()
+
 loop_count = 0
 while True:
     loop_count += 1
     # Calculate gear
-    lcd_msg("Predicted gear:")
-    for _ in range(10):
-        gear = calculate_gear(get_speed().value.magnitude, get_rpm().value.magnitude)
-        lcd.lcd_display_string(gear, 2)
-        time.sleep(0.5)
+    # We're going to comment this out for now because it conflicts with the obd_thread
+    # lcd_msg("Predicted gear:")
+    # for _ in range(10):
+    #     gear = calculate_gear(state["speed"], state["rpm"])
+    #     lcd.lcd_display_string(gear, 2)
+    #     time.sleep(0.5)
 
     # Instant MPG
-    impg = None
     lcd_msg("Instant MPG:")
     # formula from https://manuals.plus/m/8f08573961e7c5e83133532cdd853b80026fa4487393a7c52304287d758e9f39
     for _ in range(5):
-        speed_mph = get_speed().value.magnitude
-        if speed_mph > 0 and get_rpm().value.magnitude > 0:
-            impg = (
-                (14.7 / get_equiv_ratio().value.magnitude) * 6.1738 * 454 * speed_mph
-            ) / (3600 * get_maf().value.magnitude)
-            impg = min(impg, 99.9)
-            lcd.lcd_display_string(str(round(impg, 2)), 2)
-            impg_arr.append(impg)
+        if state["impg"] is not None:
+            lcd.lcd_display_string(str(state["impg"]), 2)
         else:
             lcd.lcd_display_string("----", 2)
         time.sleep(1)
 
-    # Average MPG (using currently accumulated iMPG values)
-    # TODO: This is bad. The impg_arr value can theoretically grow indefinitely, and this will become more costly to calculate over time.
-    # We should probably using a rolling average instead.
-    if len(impg_arr) > 0:
-        ampg = min(sum(impg_arr) / len(impg_arr), 99.9)
-        lcd_msg("Average MPG:", (round(ampg, 2)))
-    else:
-        lcd_msg("Average MPG:", "----")
-    time.sleep(5)
+    # Average MPG (calculated through mpg_worker())
+    lcd_msg("Average MPG:")
+    for _ in range(5):
+        if state["ampg"] is not None:
+            lcd.lcd_display_string(str(round(state["ampg"], 2)), 2)
+        else:
+            lcd.lcd_display_string("----", 2)
+        time.sleep(1)
 
     # Coolant temp
     lcd_msg("Coolant temp:")
     for _ in range(5):
-        lcd.lcd_display_string(str(get_coolant_temp().value.magnitude) + "C", 2)
+        if state["coolant_temp"] is not None:
+            lcd.lcd_display_string(str(state["coolant_temp"]) + "C", 2)
+        else:
+            lcd.lcd_display_string("----", 2)
         time.sleep(1)
 
     # Fuel level
     # TODO: In Oakley's car, this value was jumping around like crazy. Cluster showed around 45%, while the display read anywhere from 60% - 45%.
     # Is this reading accurate while in motion? Probably doesn't account for slosh. An average of the last few readings would likely be
     # better, or perhaps we only read the fuel level when the car is travelling slow enough.
-    if get_speed().value.magnitude < 3:
-        lcd_msg("Fuel level:", str(round(get_fuel_level().value.magnitude, 1)) + "%")
+    # Right now, it'll only display the fuel level when we're going slow enough, since any other time, it's probably unreliable.
+    if (
+        state["speed"] is not None
+        and state["speed"] < 3
+        and state["fuel_level"] is not None
+    ):
+        lcd_msg("Fuel level:", str(round(state["fuel_level"], 1)) + "%")
         time.sleep(5)
 
     # Car trip stats, write aMPG and fuel levels to file.
@@ -263,7 +327,7 @@ while True:
         fh.write(
             str(round(ampg, 2))
             + ","
-            + str(round(get_fuel_level().value.magnitude, 1))
+            + str(round(state['fuel_level'], 1))
             + "\n"
         )
         fh.flush()
