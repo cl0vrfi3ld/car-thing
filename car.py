@@ -2,7 +2,19 @@ import I2C_LCD_driver, obd, time, math, threading, os
 from obd import OBDStatus
 
 """
-She's got some plans.
+Running down the list of what this script does:
+ - On startup, checks adapter status, and won't proceed untli the car is detected to have the ignition on so we can collect real data.
+ - Once the car is detected, the first thing we'll do is dump all supported PIDs as well as grabbing a sample pool of data from each PID into a folder
+ named after the car's VIN. Ideally, this script can be ran on several cars, but for my purposes it's explicitly tuned for my own Accord.
+ - We then create a folder named trips, and open a file for writing there. Ideally these files would be named after a true timestamp but the Pi doesn't have a
+realtime clock, and we don't expect internet access. This file will infrequently have trip data written to it, such as runtime, recorded aMPG, and fuel level. 
+ - We then spin up a few threads, namely obd_worker and mpg_worker. obd_worker will asyncronously collect all neccessary data at all times, while mpg_worker
+ will continue aMPG calculations in the background.
+ - Finally, we get to the main loop, which is nothing more than a few simple state checks and LCD display commands.
+ - Every five loops, we write information to our trips file.
+
+
+Plans for the future:
  - Ideally the Pi would be rewired to handle shutdowns more safely. Right now, we expect power to be cut out at any 
 moment, and so we keep IO operations to a minimum. In the future, we should use a buck converter and an add-a-circuit fuse to
 hook into the car's fusebox, and let us detect when the car is turned off. 
@@ -20,6 +32,21 @@ TIRE_DIAMETER = 25.8583  # P225/50 R17
 TIRE_CIRCUMFERENCE = TIRE_DIAMETER * math.pi
 
 lcd = I2C_LCD_driver.lcd()
+
+state = {
+    "speed": None,
+    "rpm": None,
+    "maf": None,
+    "equiv_ratio": None,
+    "fuel_level": None,
+    "coolant_temp": None,
+    "runtime": None,
+    "sample_id": 0,  # Used to determine sample freshness
+    "vin": None,
+    # These values should never exceed 99.99 due to min() in mpg_worker().
+    "impg": None,
+    "ampg": None,
+}
 
 
 def lcd_msg(l1="", l2=""):
@@ -52,24 +79,24 @@ def calculate_gear(speed_mph, rpm):
 
 def dump(adapter):
     """
-    This does two things. First, we read the VIN to create a folder to hold the corresponding dump. This is an attempt to make this cross-carpatible.
+    This does two things. First, we read state["vin"] to create a folder to hold the corresponding dump. This is an attempt to make this cross-carpatible.
     Next, it'll read and dump every code the car says it supports. Last, it'll get a sample pool of data. This should be run before doing ANY work, as
     it'll conflict with the worker threads otherwise.
     """
-    vin = adapter.query(obd.commands.VIN)
+    state["vin"] = adapter.query(obd.commands.state["vin"])
 
     # Create a folder for the car's data
-    if not os.path.exists(f"{vin}"):
-        lcd_msg("New VIN", "Dumping...")
-        os.mkdir(f"{vin}")
+    if not os.path.exists(f"{state["vin"]}"):
+        lcd_msg("New state["vin"] detected", "Dumping...")
+        os.mkdir(f"{str(state["vin"])}")
         # Dump the car's supported commands to an external file
         commands = sorted(adapter.supported_commands, key=str)
-        with open(f"{vin}/supported_commands.txt", "w") as f:
+        with open(f"{state["vin"]}/supported_commands.txt", "w") as f:
             for command in commands:
                 f.write(f"{command}\n")
 
         # Dump sample data of data for every PID the car says it supports
-        with open(f"{vin}/sample_dump.txt", "w") as f:
+        with open(f"{state["vin"]}/sample_dump.txt", "w") as f:
             for command in commands:
                 try:
                     response = adapter.query(command)
@@ -86,25 +113,11 @@ def dump(adapter):
                     f.write(f"ERROR   : {e}\n")
 
     else:
-        print(f"Data for VIN {vin} already exists. Skipping dump.")
+        print(f"Data for VIN {state["vin"]} already exists. Skipping dump.")
 
 
 lock = threading.Lock()
 stop_event = threading.Event()
-
-state = {
-    "speed": None,
-    "rpm": None,
-    "maf": None,
-    "equiv_ratio": None,
-    "fuel_level": None,
-    "coolant_temp": None,
-    "runtime": None,
-    "sample_id": 0,  # Used to determine sample freshness
-    # These values should never exceed 99.99 due to min() in mpg_worker().
-    "impg": None,
-    "ampg": None,
-}
 
 
 def obd_worker():
@@ -243,7 +256,7 @@ while adapter.status() is not OBDStatus.CAR_CONNECTED:
     time.sleep(2)
     adapter = obd.OBD()
 
-# If initial loop is exited we must be good to go, dump info for VIN, and open new file for writing
+# If initial loop is exited we must be good to go, dump if required, and open new file for writing
 print("We're ready, go go go...")
 
 dump(adapter)
@@ -324,11 +337,10 @@ while True:
     # This suuuuucks.
     if loop_count % 5 == 0:
         fh.write(
-            str(round(state['runtime'], 2))
-            + ","
-            str(round(state['ampg'], 2))
-            + ","
-            + str(round(state['fuel_level'], 1))
-            + "\n"
+            str(round(state["runtime"], 2))
+            + ", "
+            + str(round(state["ampg"], 2))
+            + ", "
+            + str(round(state["fuel_level"], 1))
         )
         fh.flush()
