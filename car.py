@@ -5,11 +5,11 @@ from obd import OBDStatus
 Running down the list of what this script does:
  - On startup, checks adapter status, and won't proceed untli the car is detected to have the ignition on so we can collect real data.
  - Once the car is detected, the first thing we'll do is dump all supported PIDs as well as grabbing a sample pool of data from each PID into a folder
- named after the car's VIN. Ideally, this script can be ran on several cars, but for my purposes it's explicitly tuned for my own Accord.
- - We then create a folder named trips, and open a file for writing there. Ideally these files would be named after a true timestamp but the Pi doesn't have a
-realtime clock, and we don't expect internet access. This file will infrequently have trip data written to it, such as runtime, recorded aMPG, and fuel level. 
+   named after the car's VIN. Ideally, this script can be ran on several cars, but for my purposes it's explicitly tuned for my own Accord.
+ - We then create a folder named trips, and open a file for writing there. Ideally these files would be named after a true timestamp but the 
+   Pi doesn't have a realtime clock, and we don't expect internet access. This file will infrequently have trip data written to it, such as runtime, recorded aMPG, and fuel level. 
  - We then spin up a few threads, namely obd_worker and mpg_worker. obd_worker will asyncronously collect all neccessary data at all times, while mpg_worker
- will continue aMPG calculations in the background.
+   will continue aMPG calculations in the background.
  - Finally, we get to the main loop, which is nothing more than a few simple state checks and LCD display commands.
  - Every five loops, we write information to our trips file.
 
@@ -77,26 +77,28 @@ def calculate_gear(speed_mph, rpm):
     return theGear
 
 
-def dump(adapter):
+def setup(adapter):
     """
-    This does two things. First, we read state["vin"] to create a folder to hold the corresponding dump. This is an attempt to make this cross-carpatible.
-    Next, it'll read and dump every code the car says it supports. Last, it'll get a sample pool of data. This should be run before doing ANY work, as
-    it'll conflict with the worker threads otherwise.
+    This does a few things. First, we query the adapter to get the VIN number, which is used to create a folder to hold the corresponding dump. This is an
+    attempt to make this cross-carpatible. Next, it'll read and dump every code the car says it supports. Last, it'll get a sample pool of data. This
+    should be run before doing ANY work, as it'll conflict with the worker threads otherwise.
     """
-    state["vin"] = adapter.query(obd.commands.state["vin"])
+    state["vin"] = str(adapter.query(obd.commands.VIN).value).strip()
+    vin_dir = state["vin"]
 
-    # Create a folder for the car's data
-    if not os.path.exists(f"{state["vin"]}"):
-        lcd_msg("New state["vin"] detected", "Dumping...")
-        os.mkdir(f"{str(state["vin"])}")
+    # Create a folder for the car's data and move into it for data collection
+    if not os.path.exists(vin_dir):
+        lcd_msg(f"New {state['vin']} detected", "Setting up...")
+        os.mkdir(vin_dir)
+        os.chdir(vin_dir)
         # Dump the car's supported commands to an external file
         commands = sorted(adapter.supported_commands, key=str)
-        with open(f"{state["vin"]}/supported_commands.txt", "w") as f:
+        with open("supported_commands.txt", "w") as f:
             for command in commands:
                 f.write(f"{command}\n")
 
         # Dump sample data of data for every PID the car says it supports
-        with open(f"{state["vin"]}/sample_dump.txt", "w") as f:
+        with open("sample_dump.txt", "w") as f:
             for command in commands:
                 try:
                     response = adapter.query(command)
@@ -113,7 +115,19 @@ def dump(adapter):
                     f.write(f"ERROR   : {e}\n")
 
     else:
-        print(f"Data for VIN {state["vin"]} already exists. Skipping dump.")
+        print(f"Data for VIN {state['vin']} already exists. Skipping dump.")
+        os.chdir(vin_dir)
+
+    # Create a folder to hold trip data
+    if not os.path.exists("trips"):
+        os.mkdir("trips")
+    file_increment = 1
+    while os.path.exists("trips/trip-%s.csv" % file_increment):
+        file_increment += 1
+    global fh
+    fh = open("trips/trip-%s.csv" % file_increment, "w")
+    fh.write("runtime,ampg,fuel_level\n")
+    print("Writing to ", os.getcwd(), "trips/trip-%s.csv" % file_increment)
 
 
 lock = threading.Lock()
@@ -165,6 +179,7 @@ def mpg_worker():
                     and state["equiv_ratio"] is not None
                     and state["equiv_ratio"] > 0
                 ):
+                    # formula from https://manuals.plus/m/8f08573961e7c5e83133532cdd853b80026fa4487393a7c52304287d758e9f39
                     impg = (
                         (14.7 / state["equiv_ratio"]) * 6.1738 * 454 * state["speed"]
                     ) / (3600 * state["maf"])
@@ -242,105 +257,107 @@ def get_runtime():
 
 
 ### MAIN
-# Initialize LCD and attempt to connect to OBD adapter, if not detected, keep trying
-lcd_msg("Initializing...")
-adapter = obd.OBD()
-while adapter.status() is not OBDStatus.CAR_CONNECTED:
-    match adapter.status():
-        case OBDStatus.NOT_CONNECTED:
-            lcd_msg("Adapter not", "detected...")
-        case OBDStatus.ELM_CONNECTED:
-            lcd_msg("Adapter detected", "No car connected")
-        case OBDStatus.OBD_CONNECTED:
-            lcd_msg("Adapter detected", "No ECU response")
-    time.sleep(2)
+def main():
+    global adapter
+    # Initialize LCD and attempt to connect to OBD adapter, if not detected, keep trying
+    lcd_msg("Initializing...")
     adapter = obd.OBD()
+    while adapter.status() is not OBDStatus.CAR_CONNECTED:
+        match adapter.status():
+            case OBDStatus.NOT_CONNECTED:
+                lcd_msg("Adapter not", "detected...")
+            case OBDStatus.ELM_CONNECTED:
+                lcd_msg("Adapter detected", "No car connected")
+            case OBDStatus.OBD_CONNECTED:
+                lcd_msg("Adapter detected", "No ECU response")
+        time.sleep(2)
+        adapter = obd.OBD()
 
-# If initial loop is exited we must be good to go, dump if required, and open new file for writing
-print("We're ready, go go go...")
+    # If initial loop is exited we must be good to go, dump if required, and open new file for writing
+    print("We're ready, go go go...")
 
-dump(adapter)
+    setup(adapter)
 
-if not os.path.exists("trips"):
-    os.mkdir("trips")
-file_increment = 1
-while os.path.exists("trips/trip-%s.txt" % file_increment):
-    file_increment += 1
-fh = open("trips/trip-%s.txt" % file_increment, "w")
-print("Writing to ", os.getcwd(), "trips/trip-%s.txt" % file_increment)
-lcd_msg("Connected!", "Reading...")
-lcd.lcd_clear()
+    lcd_msg("Connected!", "Reading...")
+    lcd.lcd_clear()
 
-# TODO: Change this to handle adapter detachments after the first loop?
-# If the adapter is unplugged mid-loop the script crashes and systemd handles a restart...
-# like, this works?? but definitely not the best way to do this.
+    # TODO: Change this to handle adapter detachments after the first loop?
+    # If the adapter is unplugged mid-loop the script crashes and systemd handles a restart...
+    # like, this works?? but definitely not the best way to do this.
 
-obd_thread = threading.Thread(target=obd_worker, daemon=True)
-obd_thread.start()
-mpg_thread = threading.Thread(target=mpg_worker, daemon=True)
-mpg_thread.start()
+    obd_thread = threading.Thread(target=obd_worker, daemon=True)
+    obd_thread.start()
+    mpg_thread = threading.Thread(target=mpg_worker, daemon=True)
+    mpg_thread.start()
 
-loop_count = 0
-while True:
-    loop_count += 1
-    # Calculate gear
-    # We're going to comment this out for now because it conflicts with the obd_thread
-    # lcd_msg("Predicted gear:")
-    # for _ in range(10):
-    #     gear = calculate_gear(state["speed"], state["rpm"])
-    #     lcd.lcd_display_string(gear, 2)
-    #     time.sleep(0.5)
+    loop_count = 0
+    while True:
+        loop_count += 1
+        # Calculate gear
+        # We're going to comment this out for now because it conflicts with the obd_thread
+        # lcd_msg("Predicted gear:")
+        # for _ in range(10):
+        #     gear = calculate_gear(state["speed"], state["rpm"])
+        #     lcd.lcd_display_string(gear, 2)
+        #     time.sleep(0.5)
 
-    # Instant MPG
-    lcd_msg("Instant MPG:")
-    # formula from https://manuals.plus/m/8f08573961e7c5e83133532cdd853b80026fa4487393a7c52304287d758e9f39
-    for _ in range(5):
-        if state["impg"] is not None:
-            lcd.lcd_display_string(str(state["impg"]), 2)
-        else:
-            lcd.lcd_display_string("----", 2)
-        time.sleep(1)
+        # Instant MPG
+        lcd_msg("Instant MPG:")
+        for _ in range(5):
+            if state["impg"] is not None:
+                lcd.lcd_display_string(str(state["impg"]), 2)
+            else:
+                lcd.lcd_display_string("----", 2)
+            time.sleep(1)
 
-    # Average MPG (calculated through mpg_worker())
-    lcd_msg("Average MPG:")
-    for _ in range(5):
-        if state["ampg"] is not None:
-            lcd.lcd_display_string(str(round(state["ampg"], 2)), 2)
-        else:
-            lcd.lcd_display_string("----", 2)
-        time.sleep(1)
+        # Average MPG (calculated through mpg_worker())
+        lcd_msg("Average MPG:")
+        for _ in range(5):
+            if state["ampg"] is not None:
+                lcd.lcd_display_string(str(round(state["ampg"], 2)), 2)
+            else:
+                lcd.lcd_display_string("----", 2)
+            time.sleep(1)
 
-    # Coolant temp
-    lcd_msg("Coolant temp:")
-    for _ in range(5):
-        if state["coolant_temp"] is not None:
-            lcd.lcd_display_string(str(state["coolant_temp"]) + "C", 2)
-        else:
-            lcd.lcd_display_string("----", 2)
-        time.sleep(1)
+        # Coolant temp
+        lcd_msg("Coolant temp:")
+        for _ in range(5):
+            if state["coolant_temp"] is not None:
+                lcd.lcd_display_string(str(state["coolant_temp"]) + "C", 2)
+            else:
+                lcd.lcd_display_string("----", 2)
+            time.sleep(1)
 
-    # Fuel level
-    # TODO: In Oakley's car, this value was jumping around like crazy. Cluster showed around 45%, while the display read anywhere from 60% - 45%.
-    # Is this reading accurate while in motion? Probably doesn't account for slosh. An average of the last few readings would likely be
-    # better, or perhaps we only read the fuel level when the car is travelling slow enough.
-    # Right now, it'll only display the fuel level when we're going slow enough, since any other time, it's probably unreliable.
-    if (
-        state["speed"] is not None
-        and state["speed"] < 3
-        and state["fuel_level"] is not None
-    ):
-        lcd_msg("Fuel level:", str(round(state["fuel_level"], 1)) + "%")
-        time.sleep(5)
+        # Fuel level
+        # TODO: In Oakley's car, this value was jumping around like crazy. Cluster showed around 45%, while the display read anywhere from 60% - 45%.
+        # Is this reading accurate while in motion? Probably doesn't account for slosh. An average of the last few readings would likely be
+        # better, or perhaps we only read the fuel level when the car is travelling slow enough.
+        # Right now, it'll only display the fuel level when we're going slow enough, since any other time, it's probably unreliable.
+        if (
+            state["speed"] is not None
+            and state["speed"] < 3
+            and state["fuel_level"] is not None
+        ):
+            lcd_msg("Fuel level:", str(round(state["fuel_level"], 1)) + "%")
+            time.sleep(5)
 
-    # Car trip stats, write aMPG and fuel levels to file.
-    # Since we can't safely handle shutdowns, we just write to the file every fifth loop and hope we don't lose power mid-write.
-    # This suuuuucks.
-    if loop_count % 5 == 0:
-        fh.write(
-            str(round(state["runtime"], 2))
-            + ", "
-            + str(round(state["ampg"], 2))
-            + ", "
-            + str(round(state["fuel_level"], 1))
-        )
-        fh.flush()
+        # Car trip stats, write aMPG and fuel levels to file.
+        # Since we can't safely handle shutdowns, we just write to the file every fifth loop and hope we don't lose power mid-write.
+        # This suuuuucks.
+        if loop_count % 5 == 0:
+            runtime = state["runtime"] if state["runtime"] is not None else 0.0
+            ampg = state["ampg"] if state["ampg"] is not None else 0.0
+            fuel_level = state["fuel_level"] if state["fuel_level"] is not None else 0.0
+            fh.write(
+                str(round(runtime, 2))
+                + ","
+                + str(round(ampg, 2))
+                + ","
+                + str(round(fuel_level, 1))
+                + "\n"
+            )
+            fh.flush()
+
+
+if __name__ == "__main__":
+    main()
