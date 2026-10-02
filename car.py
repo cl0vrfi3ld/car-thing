@@ -9,8 +9,8 @@ hook into the car's fusebox, and let us detect when the car is turned off.
  - We might want some threading. LCD displays are currently blocking, this sucks. It might be best to have some file 
  operations put in a thread, or background some of the queries, such as iMPG, so we can have a more accurate aMPG reading.
  This might need a rewrite of most of this code. One single thread to handle OBD queries is the way to go.
- - Serve some data over a simple http server. Having web interface to show data on a phone connected to the Pi's hotspot could be useful for adjusting settings for 
- what to display on the LCD, or to show graphs of data collected over time.
+ - Serve some data over a simple http server. Having a web interface to show data on a phone connected to the Pi's hotspot 
+ could be useful for adjusting settings for what to display on the LCD, or to show graphs of data collected over time.
  """
 
 ###
@@ -90,6 +90,27 @@ def dump(adapter):
     else:
         print(f"Data for VIN {vin} already exists. Skipping dump.")
 
+
+lock = threading.Lock()
+stop_event = threading.Event()
+
+state = {}
+
+def obd_worker():
+    """ THREAD: Query the OBD adapter for all data we want to read (speed, rpm, maf, equiv, fuel level, runtime), and
+    update the state dict with raw values to make data available everywhere. The adapter can only receive one query at a time, so we need 
+    to lock this, as well as ensure we're not querying the adapter elsewhere.
+    """
+    while not stop_event.is_set():
+        with lock:
+            state['speed'] = get_speed().value.magnitude
+            state['rpm'] = get_rpm().value.magnitude
+            state['maf'] = get_maf().value.magnitude
+            state['equiv_ratio'] = get_equiv_ratio().value.magnitude
+            state['fuel_level'] = get_fuel_level().value.magnitude
+            state['coolant_temp'] = get_coolant_temp().value.magnitude
+            state['runtime'] = get_runtime().value.magnitude
+        time.sleep(0.5)  # Adjust sleep as needed
 
 def get_speed():
     try:
@@ -180,6 +201,7 @@ lcd.lcd_clear()
 # TODO: Change this to handle adapter detachments after the first loop?
 # If the adapter is unplugged mid-loop the script crashes and systemd handles a restart...
 # like, this works?? but definitely not the best way to do this.
+
 impg_arr = []
 ampg = None
 loop_count = 0
