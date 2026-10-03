@@ -6,8 +6,8 @@ Running down the list of what this script does:
  - On startup, checks adapter status, and won't proceed untli the car is detected to have the ignition on so we can collect real data.
  - Once the car is detected, the first thing we'll do is dump all supported PIDs as well as grabbing a sample pool of data from each PID into a folder
    named after the car's VIN. Ideally, this script can be ran on several cars, but for my purposes it's explicitly tuned for my own Accord.
- - We then create a folder named trips, and open a file for writing there. Ideally these files would be named after a true timestamp but the
-   Pi doesn't have a realtime clock, and we don't expect internet access. This file will infrequently have trip data written to it, such as runtime, recorded aMPG, and fuel level.
+ - We then create a folder named trips, and open a file for writing there. Ideally these files would be named after a true timestamp but the 
+   Pi doesn't have a realtime clock, and we don't expect internet access. This file will infrequently have trip data written to it, such as runtime, recorded aMPG, and fuel level. 
  - We then spin up a few threads, namely obd_worker and mpg_worker. obd_worker will asyncronously collect all neccessary data at all times, while mpg_worker
    will continue aMPG calculations in the background.
  - Finally, we get to the main loop, which is nothing more than a few simple state checks and LCD display commands.
@@ -15,11 +15,11 @@ Running down the list of what this script does:
 
 
 Plans for the future:
- - Ideally the Pi would be rewired to handle shutdowns more safely. Right now, we expect power to be cut out at any
+ - Ideally the Pi would be rewired to handle shutdowns more safely. Right now, we expect power to be cut out at any 
 moment, and so we keep IO operations to a minimum. In the future, we should use a buck converter and an add-a-circuit fuse to
-hook into the car's fusebox, and let us detect when the car is turned off.
+hook into the car's fusebox, and let us detect when the car is turned off. 
  - Okay so apparently python-OBD supports asyncronous calls within its library. Maybe we rewrite this again later?
- - Serve some data over a simple http server. Having a web interface to show data on a phone connected to the Pi's hotspot
+ - Serve some data over a simple http server. Having a web interface to show data on a phone connected to the Pi's hotspot 
  could be useful for adjusting settings for what to display on the LCD, or to show graphs of data collected over time.
  """
 
@@ -84,11 +84,11 @@ def setup(adapter):
     should be run before doing ANY work, as it'll conflict with the obd_worker thread. Returns file.
     """
     state["vin"] = str(adapter.query(obd.commands.VIN).value).strip()
-    vin_dir = str(state["vin"])
+    vin_dir = state["vin"]
 
     # Create a folder for the car's data and move into it for data collection
     if not os.path.exists(vin_dir):
-        lcd_msg(f"New VIN detected", "Setting up...")
+        lcd_msg(f"New {state['vin']} detected", "Setting up...")
         os.mkdir(vin_dir)
         os.chdir(vin_dir)
         # Dump the car's supported commands to an external file
@@ -118,7 +118,7 @@ def setup(adapter):
         print(f"Data for VIN {state['vin']} already exists. Skipping dump.")
         os.chdir(vin_dir)
 
-    # Create a folder to hold trip data
+    # Create a folder to hold trip data and write initial CSV values
     if not os.path.exists("trips"):
         os.mkdir("trips")
 
@@ -170,8 +170,7 @@ def obd_worker():
 def mpg_worker():
     """THREAD: Calculate instant MPG based on speed, maf, and equiv ratio values. Compare sample IDs
     to ensure that data is only calculated when samples are guaranteed fresh."""
-    impg_sample_count = 0
-    last_sample_id = 0
+    impg_sample_count, last_sample_id = 0
     while not stop_event.is_set():
         with lock:
             if state["sample_id"] != last_sample_id:
@@ -265,7 +264,7 @@ def main():
     global adapter
     # Initialize LCD and attempt to connect to OBD adapter, if not detected, keep trying
     lcd_msg("Initializing...")
-    adapter = obd.OBD()
+    adapter = obd.Async()
     last_status = None
     while True:
         status = adapter.status()
@@ -278,9 +277,9 @@ def main():
                 case OBDStatus.ELM_CONNECTED:
                     lcd_msg("Adapter detected", "No car connected")
                 case OBDStatus.OBD_CONNECTED:
-                    lcd_msg("Car connected", "Is ignition off?")
+                    lcd_msg("Car connected", "Is engine off?")
         last_status = status
-        adapter = obd.OBD()
+        adapter = obd.Async()
         time.sleep(0.5)
 
     # If initial loop is exited we must be good to go, dump if required, and open new file for writing
