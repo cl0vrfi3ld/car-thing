@@ -18,6 +18,7 @@ Plans for the future:
  - Ideally the Pi would be rewired to handle shutdowns more safely. Right now, we expect power to be cut out at any 
 moment, and so we keep IO operations to a minimum. In the future, we should use a buck converter and an add-a-circuit fuse to
 hook into the car's fusebox, and let us detect when the car is turned off. 
+ - Okay so apparently python-OBD supports asyncronous calls within its library. Maybe we rewrite this again later?
  - Serve some data over a simple http server. Having a web interface to show data on a phone connected to the Pi's hotspot 
  could be useful for adjusting settings for what to display on the LCD, or to show graphs of data collected over time.
  """
@@ -41,7 +42,7 @@ state = {
     "fuel_level": None,
     "coolant_temp": None,
     "runtime": None,
-    "sample_id": 0,  # Used to determine sample freshness
+    "sample_id": 0,  # Used later to determine sample freshness
     "vin": None,
     # These values should never exceed 99.99 due to min() in mpg_worker().
     "impg": None,
@@ -50,16 +51,15 @@ state = {
 
 
 def lcd_msg(l1="", l2=""):
-    """Clear the LCD and display two lines of text."""
+    """Takes up to two strings. Clears the LCD and display two lines of text."""
     lcd.lcd_clear()
     lcd.lcd_display_string(str(l1)[:16], 1)
     lcd.lcd_display_string(str(l2)[:16], 2)
 
 
 def calculate_gear(speed_mph, rpm):
-    """This isn't very accurate. Just for fun.
-    TODO: Can we make this more accurate?
-    """
+    """Calculates current gear based off of vehicle speed and RPM.
+    This isn't very accurate. Just for fun. Can we make this better?"""
     if speed_mph <= 5:
         return "?"
 
@@ -79,9 +79,9 @@ def calculate_gear(speed_mph, rpm):
 
 def setup(adapter):
     """
-    This does a few things. First, we query the adapter to get the VIN number, which is used to create a folder to hold the corresponding dump. This is an
-    attempt to make this cross-carpatible. Next, it'll read and dump every code the car says it supports. Last, it'll get a sample pool of data. This
-    should be run before doing ANY work, as it'll conflict with the worker threads otherwise.
+    This does a few things. First, query the adapter to get the VIN number, which is used to create a folder to hold the corresponding dump. This is an
+    attempt to make this cross-carpatible. Next, read and dump every code the car says it supports. Last, get a sample pool of data. This
+    should be run before doing ANY work, as it'll conflict with the obd_worker thread. Returns file.
     """
     state["vin"] = str(adapter.query(obd.commands.VIN).value).strip()
     vin_dir = state["vin"]
@@ -121,13 +121,19 @@ def setup(adapter):
     # Create a folder to hold trip data
     if not os.path.exists("trips"):
         os.mkdir("trips")
+
     file_increment = 1
-    while os.path.exists("trips/trip-%s.csv" % file_increment):
+    while True:
+        file_path = "trips/trip-%s.csv" % file_increment
+        if not os.path.exists(file_path):
+            break
         file_increment += 1
-    global fh
-    fh = open("trips/trip-%s.csv" % file_increment, "w")
-    fh.write("runtime,ampg,fuel_level\n")
-    print("Writing to ", os.getcwd(), "trips/trip-%s.csv" % file_increment)
+
+    with open(file_path, "w") as file:
+        print(f"Writing to {file_path}")
+        file.write("runtime,ampg,fuel_level\n")
+
+    return file_path
 
 
 lock = threading.Lock()
@@ -162,11 +168,9 @@ def obd_worker():
 
 
 def mpg_worker():
-    """THREAD: Calculate instant MPG based on speed, maf, and equiv ratio values. The function also compares sample IDs
+    """THREAD: Calculate instant MPG based on speed, maf, and equiv ratio values. Compare sample IDs
     to ensure that data is only calculated when samples are guaranteed fresh."""
-    # formula from https://manuals.plus/m/8f08573961e7c5e83133532cdd853b80026fa4487393a7c52304287d758e9f39
-    impg_sample_count = 0
-    last_sample_id = 0
+    impg_sample_count, last_sample_id = 0
     while not stop_event.is_set():
         with lock:
             if state["sample_id"] != last_sample_id:
@@ -197,7 +201,7 @@ def mpg_worker():
 
 
 # Getters
-# These all return the raw values of each query, no units included. If a query fails, None is returned.
+# These all return the raw values of each query, no units included. If a query fails for any reason, None is returned.
 def get_speed():
     try:
         return adapter.query(obd.commands.SPEED, force=True).value.magnitude
@@ -256,34 +260,37 @@ def get_runtime():
         return None
 
 
-### MAIN
 def main():
     global adapter
     # Initialize LCD and attempt to connect to OBD adapter, if not detected, keep trying
     lcd_msg("Initializing...")
-    adapter = obd.OBD()
-    while adapter.status() is not OBDStatus.CAR_CONNECTED:
-        match adapter.status():
-            case OBDStatus.NOT_CONNECTED:
-                lcd_msg("Adapter not", "detected...")
-            case OBDStatus.ELM_CONNECTED:
-                lcd_msg("Adapter detected", "No car connected")
-            case OBDStatus.OBD_CONNECTED:
-                lcd_msg("Adapter detected", "No ECU response")
-        time.sleep(2)
-        adapter = obd.OBD()
+    adapter = obd.Async()
+    last_status = None
+    while True:
+        status = adapter.status()
+        if status is OBDStatus.CAR_CONNECTED:
+            break
+        if last_status is not status:
+            match status:
+                case OBDStatus.NOT_CONNECTED:
+                    lcd_msg("Adapter not", "detected...")
+                case OBDStatus.ELM_CONNECTED:
+                    lcd_msg("Adapter detected", "No car connected")
+                case OBDStatus.OBD_CONNECTED:
+                    lcd_msg("Car connected", "Is ignition off?")
+        last_status = status
+        adapter = obd.Async()
+        time.sleep(0.5)
 
     # If initial loop is exited we must be good to go, dump if required, and open new file for writing
     print("We're ready, go go go...")
 
-    setup(adapter)
-
-    lcd_msg("Connected!", "Reading...")
-    lcd.lcd_clear()
+    trip_path = setup(adapter)
 
     # TODO: Change this to handle adapter detachments after the first loop?
     # If the adapter is unplugged mid-loop the script crashes and systemd handles a restart...
     # like, this works?? but definitely not the best way to do this.
+    # I believe there's some tolerance now, as invalid query results just return None, have yet to test
 
     obd_thread = threading.Thread(target=obd_worker, daemon=True)
     obd_thread.start()
@@ -291,10 +298,12 @@ def main():
     mpg_thread.start()
 
     loop_count = 0
+    lcd.lcd_clear()
     while True:
         loop_count += 1
         # Calculate gear
-        # We're going to comment this out for now because it conflicts with the obd_thread
+        # Commenting this out for now because it conflicts with the obd_thread
+        # and it's kind of ass anyways. this should really display the gear in the top right of the display no matter what screen the lcd is on
         # lcd_msg("Predicted gear:")
         # for _ in range(10):
         #     gear = calculate_gear(state["speed"], state["rpm"])
@@ -348,15 +357,16 @@ def main():
             runtime = state["runtime"] if state["runtime"] is not None else 0.0
             ampg = state["ampg"] if state["ampg"] is not None else 0.0
             fuel_level = state["fuel_level"] if state["fuel_level"] is not None else 0.0
-            fh.write(
-                str(round(runtime, 2))
-                + ","
-                + str(round(ampg, 2))
-                + ","
-                + str(round(fuel_level, 1))
-                + "\n"
-            )
-            fh.flush()
+            with open(trip_path, "a") as file:
+                file.write(
+                    str(round(runtime, 2))
+                    + ","
+                    + str(round(ampg, 2))
+                    + ","
+                    + str(round(fuel_level, 1))
+                    + "\n"
+                )
+                file.flush()
 
 
 if __name__ == "__main__":
